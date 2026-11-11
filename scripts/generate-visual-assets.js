@@ -2,16 +2,16 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
+const { downloadAndUnzipVSCode } = require('@vscode/test-electron');
 const { _electron: electron } = require('playwright');
 
 const REPO_ROOT = path.resolve(__dirname, '..');
-const CODE_BIN = path.join(
-  REPO_ROOT,
-  '.vscode-test/vscode-darwin-arm64-1.116.0/Visual Studio Code.app/Contents/MacOS/Code'
-);
+const VSCODE_CACHE_DIR = path.join(REPO_ROOT, '.vscode-test');
 const SCREENSHOT_DIR = path.join(REPO_ROOT, 'assets', 'screenshots');
 const FRAME_DIR = path.join(SCREENSHOT_DIR, '.gif-frames');
-const USER_DATA_DIR = path.join(REPO_ROOT, '.tmp-vscode-userdata');
+// VS Code creates its IPC socket inside the user data dir, and macOS caps
+// socket paths at 103 chars, so keep this short instead of under REPO_ROOT.
+const USER_DATA_DIR = path.join(os.tmpdir(), 'critique-markup-userdata');
 const WORKSPACE_DIR = path.join(os.tmpdir(), 'critique-markup-fixtures');
 const VIEWPORT = { width: 1280, height: 960 };
 
@@ -48,15 +48,34 @@ async function runCommand(page, commandText) {
   await page.waitForTimeout(350);
   await page.keyboard.type(commandText);
   await page.waitForTimeout(350);
+  // The palette runs its top fuzzy match, so refuse to continue if that is a
+  // different command (e.g. a toggle instead of a hide after a VS Code update).
+  const topMatch = page.locator('.quick-input-list .monaco-list-row').first();
+  const topLabel = (await topMatch.getAttribute('aria-label')) ?? '';
+  if (!topLabel.startsWith(commandText)) {
+    await page.keyboard.press('Escape');
+    throw new Error(`Command palette would run "${topLabel}" instead of "${commandText}"`);
+  }
   await page.keyboard.press('Enter');
   await page.waitForTimeout(500);
+}
+
+// VS Code only offers the "Hide ..." commands while that part is visible.
+async function hidePart(page, partSelector, commandText) {
+  if (await page.locator(`${partSelector}:visible`).count()) {
+    await runCommand(page, commandText);
+  }
+}
+
+async function hidePanel(page) {
+  await hidePart(page, '.part.panel', 'View: Hide Panel');
 }
 
 async function configureWorkbench(page) {
   await page.waitForTimeout(6000);
   await dismissNoise(page);
-  await runCommand(page, 'View: Close Secondary Side Bar');
-  await runCommand(page, 'View: Appearance: Hide Panel');
+  await hidePart(page, '.part.auxiliarybar', 'View: Hide Secondary Side Bar');
+  await hidePanel(page);
   await runCommand(page, 'View: Reset Zoom');
 }
 
@@ -99,8 +118,14 @@ async function lineClip(page, textRegex, options = {}) {
   };
 }
 
+// Playwright hides the text caret by restyling every editable element before
+// each screenshot; on VS Code 1.146 that could close the review hover mid-capture
+// (seen while a terminal was open). VS Code draws its own cursor, so skipping
+// the caret hiding does not change what is captured.
+const SCREENSHOT_OPTIONS = { caret: 'initial' };
+
 async function capturePng(page, outputName, options = {}) {
-  await page.screenshot({ path: path.join(SCREENSHOT_DIR, outputName), clip: options.clip });
+  await page.screenshot({ ...SCREENSHOT_OPTIONS, path: path.join(SCREENSHOT_DIR, outputName), clip: options.clip });
 }
 
 async function captureCropped(page, textRegex, outputName, options = {}) {
@@ -114,13 +139,13 @@ async function captureOptimizedStill(page, baseName, options = {}) {
   const pngPath = path.join(SCREENSHOT_DIR, `${baseName}.png`);
   const jpgPath = path.join(SCREENSHOT_DIR, `${baseName}.jpg`);
 
-  await page.screenshot({ path: pngTemp, clip: options.clip });
+  await page.screenshot({ ...SCREENSHOT_OPTIONS, path: pngTemp, clip: options.clip });
 
   if (options.gifFrame) {
     fs.copyFileSync(pngTemp, path.join(FRAME_DIR, `${baseName}.png`));
   }
 
-  await page.screenshot({ path: jpgTemp, clip: options.clip, type: 'jpeg', quality: 94 });
+  await page.screenshot({ ...SCREENSHOT_OPTIONS, path: jpgTemp, clip: options.clip, type: 'jpeg', quality: 94 });
 
   const pngSize = fs.statSync(pngTemp).size;
   const jpgSize = fs.statSync(jpgTemp).size;
@@ -144,13 +169,26 @@ async function showHover(page, textRegex) {
   const locator = page.getByText(textRegex).first();
   await locator.click();
   await page.waitForTimeout(300);
-  await runCommand(page, 'Show Hover');
+  // Full name: a bare "Show Hover" matches "Show Definition Preview Hover" first,
+  // which waits for a Markdown definition lookup before showing anything.
+  await runCommand(page, 'Show or Focus Hover');
+  try {
+    await reviewHover(page).waitFor({ state: 'visible', timeout: 5000 });
+  } catch {
+    throw new Error(`Review hover for ${textRegex} did not appear; not capturing a screenshot without it`);
+  }
   await page.waitForTimeout(1200);
 }
 
-async function closePanel(page) {
-  await page.mouse.click(1258, 685);
-  await page.waitForTimeout(500);
+function reviewHover(page) {
+  return page.locator('.monaco-hover:visible').filter({ hasText: 'Accept' }).first();
+}
+
+// Call right after capturing a screenshot that is meant to show the hover.
+async function expectHoverStillVisible(page, assetName) {
+  if (!(await reviewHover(page).count())) {
+    throw new Error(`Review hover closed before ${assetName} was captured`);
+  }
 }
 
 async function showContextMenuOverlay(page) {
@@ -210,6 +248,12 @@ async function showContextMenuOverlay(page) {
   });
 }
 
+async function hideContextMenuOverlay(page) {
+  await page.evaluate(() => {
+    document.getElementById('critique-markup-context-menu-demo')?.remove();
+  });
+}
+
 function makeGif(framePattern, outputName, fps = 1 / 3) {
   const palettePath = path.join(SCREENSHOT_DIR, '._palette.png');
   execFileSync(
@@ -261,7 +305,7 @@ async function prepareCommentHoverState(page, textRegex = /Migration/) {
 
 async function createAddCommentOverScenario(page) {
   await openFile(page, 'comment.md');
-  await runCommand(page, 'View: Appearance: Hide Panel');
+  await hidePanel(page);
   await prepareCommentHoverState(page, /Migration/);
 }
 
@@ -277,16 +321,14 @@ async function createAcceptEditsScenario(page) {
 async function createPlanReviewScenario(page) {
   console.log('Preparing LLM plan review frame');
   await openFile(page, 'plan.md');
-  await runCommand(page, 'View: Appearance: Hide Panel');
-  await closePanel(page);
+  await hidePanel(page);
   await page.waitForTimeout(1800);
 }
 
 async function createContextMenuScenario(page) {
   console.log('Preparing right-click context menu frame');
   await openFile(page, 'plan.md');
-  await runCommand(page, 'View: Appearance: Hide Panel');
-  await closePanel(page);
+  await hidePanel(page);
 
   const startX = 415;
   const endX = 900;
@@ -303,13 +345,16 @@ async function createContextMenuScenario(page) {
 }
 
 (async () => {
+  // Same cache as `npm test`; downloads latest stable only if it isn't there yet.
+  const codeBin = await downloadAndUnzipVSCode({ cachePath: VSCODE_CACHE_DIR });
+
   resetDir(SCREENSHOT_DIR);
   resetDir(FRAME_DIR);
   copyFixtures();
   resetDir(USER_DATA_DIR);
 
   const app = await electron.launch({
-    executablePath: CODE_BIN,
+    executablePath: codeBin,
     args: [
       WORKSPACE_DIR,
       '--user-data-dir=' + USER_DATA_DIR,
@@ -334,21 +379,23 @@ async function createContextMenuScenario(page) {
     await configureWorkbench(page);
 
     await openFile(page, 'visual-regression.md');
-    await runCommand(page, 'View: Appearance: Hide Panel');
+    await hidePanel(page);
     await prepareCommentHoverState(page, /Migration/);
     console.log('Capturing frame 01');
     expected.push(await captureOptimizedStill(page, '01-full-feature', { gifFrame: true }));
+    await expectHoverStillVisible(page, '01-full-feature');
     await page.keyboard.press('Escape');
     await page.waitForTimeout(300);
 
     await createAddCommentOverScenario(page);
     console.log('Capturing frame 02');
     expected.push(await captureOptimizedStill(page, '02-adding-comment-over', { gifFrame: true }));
+    await expectHoverStillVisible(page, '02-adding-comment-over');
     await page.keyboard.press('Escape');
     await page.waitForTimeout(300);
 
     await createAcceptEditsScenario(page);
-    await runCommand(page, 'View: Appearance: Hide Panel');
+    await hidePanel(page);
     console.log('Capturing frame 03');
     expected.push(await captureOptimizedStill(page, '03-accepting-edits', { gifFrame: true }));
     await page.keyboard.press('Escape');
@@ -363,6 +410,7 @@ async function createContextMenuScenario(page) {
     await createContextMenuScenario(page);
     console.log('Capturing frame 05');
     expected.push(await captureOptimizedStill(page, '05-right-click-comment-over', { gifFrame: true }));
+    await hideContextMenuOverlay(page);
     await page.keyboard.press('Escape');
     await page.waitForTimeout(300);
 
@@ -381,6 +429,7 @@ async function createContextMenuScenario(page) {
 
     await showHover(page, /Migration/);
     await capturePng(page, 'tooltip-bubble.png');
+    await expectHoverStillVisible(page, 'tooltip-bubble.png');
     await page.keyboard.press('Escape');
     await page.waitForTimeout(300);
   } finally {
